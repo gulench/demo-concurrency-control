@@ -1,0 +1,31 @@
+{
+  "lines": [
+    {
+      "lineId": "0",
+      "groupKey": "orderA",
+      "data": "item0",
+      "metadata": "optional"
+    },
+    {
+      "lineId": "1",
+      "groupKey": "orderA",
+      "data": "item1",
+      "metadata": "optional"
+    },
+    {
+      "lineId": "2",
+      "groupKey": "orderA",
+      "data": "item2"
+    },
+    {
+      "lineId": "3",
+      "groupKey": "orderB",
+      "data": "item3"
+    },
+    {
+      "lineId": "4",
+      "groupKey": null,
+      "data": "item4"
+    }
+  ]
+}
