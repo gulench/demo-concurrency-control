@@ -2,6 +2,7 @@ package com.example.demo.concurrencycontrol.service;
 
 import com.example.demo.concurrencycontrol.ConcurrentProcessingConfig;
 import com.example.demo.concurrencycontrol.model.*;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Qualifier;
@@ -14,7 +15,8 @@ import java.util.stream.Collectors;
 /**
  * Core service for processing lines with controlled concurrency at both request
  * and system levels.
- * Supports partial success - lines can succeed or fail independently.
+ * Supports partial success - lines can succeed or fail independently, even
+ * within groups that timeout.
  */
 @Service
 public class ConcurrentLineProcessorService {
@@ -60,19 +62,23 @@ public class ConcurrentLineProcessorService {
         // Step 2: Create a semaphore for request-level concurrency control
         Semaphore requestLevelSemaphore = new Semaphore(config.getMaxConcurrentGroupsPerRequest());
 
-        // Step 3: Track group futures with their metadata
+        // Step 3: Track group processing tasks with progress tracking
         List<GroupProcessingTask> groupTasks = new ArrayList<>();
 
         for (Map.Entry<String, List<LineItem>> entry : groups.entrySet()) {
             String groupKey = entry.getKey();
             List<LineItem> groupLines = entry.getValue();
 
+            // Create progress tracker for this group
+            GroupProgressTracker progressTracker = new GroupProgressTracker(groupKey, groupLines);
+
             CompletableFuture<List<LineResult>> groupFuture = processGroupWithSemaphore(
                     groupKey,
                     groupLines,
+                    progressTracker,
                     requestLevelSemaphore);
 
-            groupTasks.add(new GroupProcessingTask(groupKey, groupLines, groupFuture));
+            groupTasks.add(new GroupProcessingTask(groupKey, groupLines, groupFuture, progressTracker));
         }
 
         // Step 4: Wait for all groups to complete with timeout, collecting partial
@@ -98,7 +104,9 @@ public class ConcurrentLineProcessorService {
     /**
      * Wait for all group futures to complete, handling timeouts gracefully.
      * Returns results for all completed groups and creates timeout results for
-     * incomplete groups.
+     * incomplete lines.
+     * CRITICALLY: Uses progress trackers to get partial results from timed-out
+     * groups.
      */
     private List<LineResult> waitForGroupsWithPartialSuccess(
             List<GroupProcessingTask> groupTasks,
@@ -146,20 +154,14 @@ public class ConcurrentLineProcessorService {
                         logger.debug("Collected {} results from completed group {}",
                                 groupResults.size(), task.groupKey);
                     } else {
-                        // Future completed but returned null - treat as failure
-                        allResults.addAll(createFailureResults(
-                                task.groupLines,
-                                task.groupKey,
-                                "Group processing returned null"));
+                        // Future completed but returned null - use progress tracker
+                        allResults.addAll(getPartialResultsFromTracker(task));
                     }
 
                 } catch (Exception e) {
-                    // Exception occurred during group processing
-                    logger.error("Group {} failed with exception", task.groupKey, e);
-                    allResults.addAll(createFailureResults(
-                            task.groupLines,
-                            task.groupKey,
-                            "Group processing failed: " + e.getMessage()));
+                    // Exception occurred - get whatever was completed from progress tracker
+                    logger.error("Group {} failed with exception, retrieving partial results", task.groupKey, e);
+                    allResults.addAll(getPartialResultsFromTracker(task));
                 }
 
             } else if (remainingTime > 100) {
@@ -173,25 +175,24 @@ public class ConcurrentLineProcessorService {
                             groupResults.size(), task.groupKey);
 
                 } catch (TimeoutException e) {
-                    // This specific group timed out
-                    logger.warn("Group {} timed out", task.groupKey);
+                    // This specific group timed out - get partial results from progress tracker
+                    logger.warn("Group {} timed out, retrieving {} partial results",
+                            task.groupKey, task.progressTracker.getCompletedCount());
                     task.future.cancel(true);
-                    allResults.addAll(createTimeoutResults(task.groupLines, task.groupKey));
+                    allResults.addAll(getPartialResultsFromTracker(task));
 
                 } catch (Exception e) {
-                    logger.error("Group {} failed", task.groupKey, e);
+                    logger.error("Group {} failed, retrieving partial results", task.groupKey, e);
                     task.future.cancel(true);
-                    allResults.addAll(createFailureResults(
-                            task.groupLines,
-                            task.groupKey,
-                            "Group processing failed: " + e.getMessage()));
+                    allResults.addAll(getPartialResultsFromTracker(task));
                 }
 
             } else {
-                // No time left - mark as timeout
-                logger.warn("Group {} did not complete in time", task.groupKey);
+                // No time left - get partial results from progress tracker
+                logger.warn("Group {} did not complete in time, retrieving {} partial results",
+                        task.groupKey, task.progressTracker.getCompletedCount());
                 task.future.cancel(true);
-                allResults.addAll(createTimeoutResults(task.groupLines, task.groupKey));
+                allResults.addAll(getPartialResultsFromTracker(task));
             }
         }
 
@@ -199,13 +200,36 @@ public class ConcurrentLineProcessorService {
     }
 
     /**
+     * Get partial results from a group's progress tracker.
+     * This includes all lines that were successfully processed before
+     * timeout/failure,
+     * and marks unprocessed lines as TIMEOUT.
+     */
+    private List<LineResult> getPartialResultsFromTracker(GroupProcessingTask task) {
+        List<LineResult> results = new ArrayList<>();
+
+        // Get all completed results (successful or failed)
+        results.addAll(task.progressTracker.getCompletedResults());
+
+        // Mark remaining unprocessed lines as timeout
+        List<LineItem> unprocessedLines = task.progressTracker.getUnprocessedLines();
+        for (LineItem line : unprocessedLines) {
+            results.add(LineResult.timeout(line.getLineId(), task.groupKey));
+            logger.debug("Marking unprocessed line {} in group {} as TIMEOUT",
+                    line.getLineId(), task.groupKey);
+        }
+
+        return results;
+    }
+
+    /**
      * Process a single group of lines with semaphore-controlled concurrency.
-     * Even if permit acquisition fails, returns failure results instead of
-     * throwing.
+     * Updates progress tracker as lines are processed.
      */
     private CompletableFuture<List<LineResult>> processGroupWithSemaphore(
             String groupKey,
             List<LineItem> groupLines,
+            GroupProgressTracker progressTracker,
             Semaphore semaphore) {
 
         return CompletableFuture.supplyAsync(() -> {
@@ -219,38 +243,47 @@ public class ConcurrentLineProcessorService {
 
                 if (!permitAcquired) {
                     logger.warn("Failed to acquire permit for group {} within timeout", groupKey);
-                    return groupLines.stream()
-                            .map(line -> LineResult.failure(
-                                    line.getLineId(),
-                                    groupKey,
-                                    "Failed to acquire processing permit (system busy)"))
-                            .collect(Collectors.toList());
+                    // Mark all lines as failed due to permit acquisition failure
+                    for (LineItem line : groupLines) {
+                        LineResult result = LineResult.failure(
+                                line.getLineId(),
+                                groupKey,
+                                "Failed to acquire processing permit (system busy)");
+                        progressTracker.recordResult(line, result);
+                    }
+                    return progressTracker.getCompletedResults();
                 }
 
                 logger.debug("Processing group {} with {} lines", groupKey, groupLines.size());
 
-                // Process lines in the group serially (allows partial success within group)
-                return processGroupSerially(groupKey, groupLines);
+                // Process lines in the group serially with progress tracking
+                return processGroupSerially(groupKey, groupLines, progressTracker);
 
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 logger.error("Interrupted while acquiring permit for group {}", groupKey, e);
-                return groupLines.stream()
-                        .map(line -> LineResult.failure(
-                                line.getLineId(),
-                                groupKey,
-                                "Processing interrupted"))
-                        .collect(Collectors.toList());
+                // Mark unprocessed lines as failed
+                for (LineItem line : progressTracker.getUnprocessedLines()) {
+                    LineResult result = LineResult.failure(
+                            line.getLineId(),
+                            groupKey,
+                            "Processing interrupted");
+                    progressTracker.recordResult(line, result);
+                }
+                return progressTracker.getCompletedResults();
 
             } catch (Exception e) {
-                // Catch any unexpected exceptions to ensure we return results
+                // Catch any unexpected exceptions
                 logger.error("Unexpected error processing group {}", groupKey, e);
-                return groupLines.stream()
-                        .map(line -> LineResult.failure(
-                                line.getLineId(),
-                                groupKey,
-                                "Unexpected error: " + e.getMessage()))
-                        .collect(Collectors.toList());
+                // Mark unprocessed lines as failed
+                for (LineItem line : progressTracker.getUnprocessedLines()) {
+                    LineResult result = LineResult.failure(
+                            line.getLineId(),
+                            groupKey,
+                            "Unexpected error: " + e.getMessage());
+                    progressTracker.recordResult(line, result);
+                }
+                return progressTracker.getCompletedResults();
 
             } finally {
                 if (permitAcquired) {
@@ -260,34 +293,30 @@ public class ConcurrentLineProcessorService {
         }, systemExecutor).exceptionally(throwable -> {
             // Handle any exceptions from the CompletableFuture itself
             logger.error("CompletableFuture exception for group {}", groupKey, throwable);
-            return groupLines.stream()
-                    .map(line -> LineResult.failure(
-                            line.getLineId(),
-                            groupKey,
-                            "Async execution failed: " + throwable.getMessage()))
-                    .collect(Collectors.toList());
+            // Mark unprocessed lines as failed
+            for (LineItem line : progressTracker.getUnprocessedLines()) {
+                LineResult result = LineResult.failure(
+                        line.getLineId(),
+                        groupKey,
+                        "Async execution failed: " + throwable.getMessage());
+                progressTracker.recordResult(line, result);
+            }
+            return progressTracker.getCompletedResults();
         });
     }
 
     /**
      * Process lines within a group serially to maintain ordering.
-     * Supports partial success - continues processing remaining lines even if one
-     * fails.
+     * Records progress after each line to support partial success on timeout.
      */
-    private List<LineResult> processGroupSerially(String groupKey, List<LineItem> groupLines) {
-        List<LineResult> results = new ArrayList<>();
-
+    private List<LineResult> processGroupSerially(String groupKey, List<LineItem> groupLines,
+            GroupProgressTracker progressTracker) {
         for (LineItem line : groupLines) {
             // Check if thread was interrupted (for cancellation support)
             if (Thread.currentThread().isInterrupted()) {
-                logger.warn("Thread interrupted while processing group {}. Marking remaining lines as failed.",
-                        groupKey);
-                // Mark remaining lines as failed due to interruption
-                results.add(LineResult.failure(
-                        line.getLineId(),
-                        groupKey,
-                        "Processing interrupted"));
-                continue;
+                logger.warn("Thread interrupted while processing group {}. Stopping further processing.", groupKey);
+                // Remaining lines will be marked as timeout by the caller
+                break;
             }
 
             long lineStartTime = System.currentTimeMillis();
@@ -296,11 +325,14 @@ public class ConcurrentLineProcessorService {
                 String result = processingService.processLine(line);
                 long processingTime = System.currentTimeMillis() - lineStartTime;
 
-                results.add(LineResult.success(
+                LineResult lineResult = LineResult.success(
                         line.getLineId(),
                         groupKey,
                         result,
-                        processingTime));
+                        processingTime);
+
+                // CRITICAL: Record result immediately so it's available even if group times out
+                progressTracker.recordResult(line, lineResult);
 
                 logger.debug("Successfully processed line {} in group {} ({}ms)",
                         line.getLineId(), groupKey, processingTime);
@@ -308,44 +340,32 @@ public class ConcurrentLineProcessorService {
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 logger.error("Processing interrupted for line {} in group {}", line.getLineId(), groupKey);
-                results.add(LineResult.failure(
+
+                LineResult lineResult = LineResult.failure(
                         line.getLineId(),
                         groupKey,
-                        "Processing interrupted"));
-                // Continue marking remaining lines as failed
+                        "Processing interrupted");
+                progressTracker.recordResult(line, lineResult);
+
+                // Stop processing remaining lines
+                break;
 
             } catch (Exception e) {
                 logger.error("Failed to process line {} in group {}", line.getLineId(), groupKey, e);
-                results.add(LineResult.failure(
+
+                LineResult lineResult = LineResult.failure(
                         line.getLineId(),
                         groupKey,
-                        e.getMessage() != null ? e.getMessage() : "Processing failed"));
+                        e.getMessage() != null ? e.getMessage() : "Processing failed");
+
+                // CRITICAL: Record failure immediately
+                progressTracker.recordResult(line, lineResult);
 
                 // PARTIAL SUCCESS: Continue processing remaining lines in the group
-                // If you want fail-fast behavior for the group, uncomment the line below:
-                // break;
             }
         }
 
-        return results;
-    }
-
-    /**
-     * Create timeout results for lines that didn't complete in time.
-     */
-    private List<LineResult> createTimeoutResults(List<LineItem> lines, String groupKey) {
-        return lines.stream()
-                .map(line -> LineResult.timeout(line.getLineId(), groupKey))
-                .collect(Collectors.toList());
-    }
-
-    /**
-     * Create failure results for lines in a failed group.
-     */
-    private List<LineResult> createFailureResults(List<LineItem> lines, String groupKey, String errorMessage) {
-        return lines.stream()
-                .map(line -> LineResult.failure(line.getLineId(), groupKey, errorMessage))
-                .collect(Collectors.toList());
+        return progressTracker.getCompletedResults();
     }
 
     /**
@@ -379,12 +399,64 @@ public class ConcurrentLineProcessorService {
         final String groupKey;
         final List<LineItem> groupLines;
         final CompletableFuture<List<LineResult>> future;
+        final GroupProgressTracker progressTracker;
 
         GroupProcessingTask(String groupKey, List<LineItem> groupLines,
-                CompletableFuture<List<LineResult>> future) {
+                CompletableFuture<List<LineResult>> future,
+                GroupProgressTracker progressTracker) {
             this.groupKey = groupKey;
             this.groupLines = groupLines;
             this.future = future;
+            this.progressTracker = progressTracker;
+        }
+    }
+
+    /**
+     * Thread-safe progress tracker for a group.
+     * Tracks which lines have been processed and their results in real-time.
+     */
+    private static class GroupProgressTracker {
+        private final String groupKey;
+        private final List<LineItem> allLines;
+        private final Map<String, LineResult> completedResults;
+        private final Set<String> processedLineIds;
+
+        public GroupProgressTracker(String groupKey, List<LineItem> allLines) {
+            this.groupKey = groupKey;
+            this.allLines = new ArrayList<>(allLines);
+            this.completedResults = new ConcurrentHashMap<>();
+            this.processedLineIds = ConcurrentHashMap.newKeySet();
+        }
+
+        /**
+         * Record a result for a line (thread-safe).
+         */
+        public synchronized void recordResult(LineItem line, LineResult result) {
+            completedResults.put(line.getLineId(), result);
+            processedLineIds.add(line.getLineId());
+        }
+
+        /**
+         * Get all completed results so far.
+         */
+        public synchronized List<LineResult> getCompletedResults() {
+            return new ArrayList<>(completedResults.values());
+        }
+
+        /**
+         * Get lines that haven't been processed yet.
+         */
+        public synchronized List<LineItem> getUnprocessedLines() {
+            return allLines.stream()
+                    .filter(line -> !processedLineIds.contains(line.getLineId()))
+                    .collect(Collectors.toList());
+        }
+
+        /**
+         * Get count of completed lines.
+         */
+        public synchronized int getCompletedCount() {
+            return completedResults.size();
         }
     }
 
