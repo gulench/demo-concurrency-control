@@ -1,6 +1,13 @@
 package com.example.demo.concurrencycontrol.model;
 
+import com.fasterxml.jackson.annotation.JsonInclude;
+
+/**
+ * Result for a single processed line.
+ */
+@JsonInclude(JsonInclude.Include.NON_NULL)
 public class LineResult {
+
     private String lineId;
     private String groupKey;
     private ProcessingStatus status;
@@ -27,6 +34,12 @@ public class LineResult {
     public static LineResult failure(String lineId, String groupKey, String errorMessage) {
         LineResult lr = new LineResult(lineId, groupKey, ProcessingStatus.FAILED);
         lr.setErrorMessage(errorMessage);
+        return lr;
+    }
+
+    public static LineResult timeout(String lineId, String groupKey) {
+        LineResult lr = new LineResult(lineId, groupKey, ProcessingStatus.TIMEOUT);
+        lr.setErrorMessage("Processing timed out");
         return lr;
     }
 

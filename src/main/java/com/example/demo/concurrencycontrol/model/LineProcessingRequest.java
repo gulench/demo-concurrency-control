@@ -6,7 +6,11 @@ import java.util.List;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotEmpty;
 
+/**
+ * Request containing multiple lines to be processed.
+ */
 public class LineProcessingRequest {
+
     @NotEmpty(message = "Lines cannot be empty")
     @Valid
     private List<LineItem> lines = new ArrayList<>();

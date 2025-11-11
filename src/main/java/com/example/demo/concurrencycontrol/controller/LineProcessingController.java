@@ -4,7 +4,6 @@ import com.example.demo.concurrencycontrol.model.LineProcessingRequest;
 import com.example.demo.concurrencycontrol.model.LineProcessingResponse;
 import com.example.demo.concurrencycontrol.model.ProcessingSummary;
 import com.example.demo.concurrencycontrol.service.ConcurrentLineProcessorService;
-import com.example.demo.concurrencycontrol.service.ConcurrentLineProcessorService.ProcessingException;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.Timer;
@@ -72,26 +71,40 @@ public class LineProcessingController {
         logger.info("Received request to process {} lines", request.getLines().size());
 
         return processingTimer.record(() -> {
-            try {
-                LineProcessingResponse response = processorService.processLines(request);
+            // Process lines - now always returns a response (never throws
+            // ProcessingException)
+            LineProcessingResponse response = processorService.processLines(request);
 
+            // Determine HTTP status based on results
+            boolean hasSuccessful = response.getSummary().getSuccessfulLines() > 0;
+            boolean hasFailed = response.getSummary().getFailedLines() > 0
+                    || response.getSummary().getTimeoutLines() > 0;
+
+            if (hasSuccessful && !hasFailed) {
+                // All lines succeeded
                 successCounter.increment();
-
-                logger.info("Successfully processed request with {} lines, {} succeeded, {} failed",
-                        response.getSummary().getTotalLines(),
-                        response.getSummary().getSuccessfulLines(),
-                        response.getSummary().getFailedLines());
-
+                logger.info("Successfully processed all {} lines",
+                        response.getSummary().getTotalLines());
                 return ResponseEntity.ok(response);
 
-            } catch (ProcessingException e) {
+            } else if (hasSuccessful && hasFailed) {
+                // Partial success - return 207 Multi-Status
+                successCounter.increment();
+                logger.warn("Partial success: {} succeeded, {} failed, {} timeout",
+                        response.getSummary().getSuccessfulLines(),
+                        response.getSummary().getFailedLines(),
+                        response.getSummary().getTimeoutLines());
+                return ResponseEntity.status(HttpStatus.MULTI_STATUS).body(response);
+
+            } else {
+                // All lines failed
                 failureCounter.increment();
-
-                logger.error("Failed to process lines", e);
-
+                logger.error("All lines failed: {} failed, {} timeout",
+                        response.getSummary().getFailedLines(),
+                        response.getSummary().getTimeoutLines());
                 return ResponseEntity
                         .status(HttpStatus.INTERNAL_SERVER_ERROR)
-                        .body(createErrorResponse(e.getMessage()));
+                        .body(response);
             }
         });
     }

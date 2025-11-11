@@ -2,7 +2,11 @@ package com.example.demo.concurrencycontrol.model;
 
 import jakarta.validation.constraints.NotNull;
 
+/**
+ * Individual line item in the request.
+ */
 public class LineItem {
+
     @NotNull(message = "Line ID is required")
     private String lineId;
 

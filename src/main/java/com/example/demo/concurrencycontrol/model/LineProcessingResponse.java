@@ -3,7 +3,14 @@ package com.example.demo.concurrencycontrol.model;
 import java.util.ArrayList;
 import java.util.List;
 
+import com.fasterxml.jackson.annotation.JsonInclude;
+
+/**
+ * Response containing results for all processed lines.
+ */
+@JsonInclude(JsonInclude.Include.NON_NULL)
 public class LineProcessingResponse {
+
     private List<LineResult> results = new ArrayList<>();
 
     private ProcessingSummary summary;

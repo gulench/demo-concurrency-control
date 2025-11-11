@@ -1,9 +1,17 @@
 package com.example.demo.concurrencycontrol.model;
 
+import com.fasterxml.jackson.annotation.JsonInclude;
+
+/**
+ * Summary of processing execution.
+ */
+@JsonInclude(JsonInclude.Include.NON_NULL)
 public class ProcessingSummary {
+
     private int totalLines;
     private int successfulLines;
     private int failedLines;
+    private int timeoutLines;
     private int totalGroups;
     private long totalProcessingTimeMs;
 
@@ -11,10 +19,11 @@ public class ProcessingSummary {
     }
 
     public ProcessingSummary(int totalLines, int successfulLines, int failedLines,
-            int totalGroups, long totalProcessingTimeMs) {
+            int timeoutLines, int totalGroups, long totalProcessingTimeMs) {
         this.totalLines = totalLines;
         this.successfulLines = successfulLines;
         this.failedLines = failedLines;
+        this.timeoutLines = timeoutLines;
         this.totalGroups = totalGroups;
         this.totalProcessingTimeMs = totalProcessingTimeMs;
     }
@@ -42,6 +51,14 @@ public class ProcessingSummary {
 
     public void setFailedLines(int failedLines) {
         this.failedLines = failedLines;
+    }
+
+    public int getTimeoutLines() {
+        return timeoutLines;
+    }
+
+    public void setTimeoutLines(int timeoutLines) {
+        this.timeoutLines = timeoutLines;
     }
 
     public int getTotalGroups() {
